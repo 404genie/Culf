@@ -1,6 +1,7 @@
 import asyncio, hashlib, re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from math import log2
 from urllib.parse import quote
 import feedparser, httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -60,8 +61,87 @@ def safety(title,summary,extra=''):
     if hits:return 'blocked','Policy term: '+', '.join(sorted(hits))
     if len(title.strip())<8 or len(summary.strip())<20:return 'held','Thin event identity or evidence summary.'
     return 'clear','Passed deterministic text checks.'
-def score(signals,min_score=68,min_families=2):
-    current=[]; ages=[]; stamp_now=now()
+def velocity_score(signals):
+    # Count active source-family/hour buckets, so syndicated copies in the same
+    # family and hour do not masquerade as growing attention.
+    recent=set();baseline=set();metrics=[];stamp_now=now()
+    for s in signals:
+        if s.get('calendar'):continue
+        observed=s.get('observed') or s.get('published')
+        if isinstance(observed,str):
+            try:observed=datetime.fromisoformat(observed.replace('Z','+00:00'))
+            except ValueError:observed=None
+        if observed:
+            if observed.tzinfo is None:observed=observed.replace(tzinfo=timezone.utc)
+            age=(stamp_now-observed).total_seconds()/3600
+            if 0<=age<=72:
+                bucket=(s.get('family','unknown'),int(observed.timestamp()//3600))
+                if age<=6:recent.add(bucket)
+                else:baseline.add(bucket)
+                metric=float(s.get('metric') or 0)
+                if metric>0:metrics.append((observed,metric))
+    if not recent:return 0
+    if baseline:
+        ratio=(len(recent)/6+.02)/(len(baseline)/66+.02)
+        report_score=max(0,min(100,round(50+18*log2(ratio))))
+    else:
+        # Without a historical baseline, reflect recent source-family activity
+        # conservatively; never present it as measured acceleration.
+        report_score=min(65,45+10*(min(len(recent),3)-1))
+    metrics.sort(key=lambda x:x[0])
+    if len(metrics)>=2 and metrics[-2][1]>0:
+        ratio=(metrics[-1][1]+1)/(metrics[-2][1]+1)
+        pageview_score=max(0,min(100,round(50+18*log2(ratio))))
+        return round(.75*report_score+.25*pageview_score)
+    return report_score
+
+def freshness_score(signals):
+    # Score each independent family by its freshest supporting item, then
+    # average families so repeated copies from one outlet cannot dominate.
+    family_ages={};stamp_now=now()
+    for s in signals:
+        if s.get('calendar'):continue
+        t=s.get('published') or s.get('observed')
+        if isinstance(t,str):
+            try:t=datetime.fromisoformat(t.replace('Z','+00:00'))
+            except ValueError:t=None
+        if not t:continue
+        if t.tzinfo is None:t=t.replace(tzinfo=timezone.utc)
+        age=max(0,(stamp_now-t).total_seconds()/3600)
+        if age>72:continue
+        family=s.get('family','unknown');family_ages[family]=min(age,family_ages.get(family,age))
+    def age_points(age):
+        if age<=1:return 100
+        if age<=6:return round(100-15*(age-1)/5)
+        if age<=24:return round(85-35*(age-6)/18)
+        return round(50*(72-age)/48)
+    return round(sum(age_points(age) for age in family_ages.values())/len(family_ages)) if family_ages else 0
+
+def novelty_scores(events):
+    # Novelty means unusual relative to prior candidate titles from the same
+    # region. Percentile ranking avoids assigning every unseen title 100.
+    vocab={e.id:terms(e.title) for e in events};raw={}
+    for e in events:
+        peers=[p for p in events if p.id!=e.id and p.region==e.region]
+        words=vocab[e.id]
+        if len(peers)<5 or not words:
+            raw[e.id]=.5;continue
+        peer_words=[vocab[p.id] for p in peers]
+        familiarity=sum(sum(1 for pwords in peer_words if word in pwords)/len(peers) for word in words)/len(words)
+        similarity=max((len(words&pwords)/max(1,len(words|pwords)) for pwords in peer_words),default=0)
+        raw[e.id]=.5*(1-familiarity)+.5*(1-similarity)
+    result={}
+    for e in events:
+        peers=[p for p in events if p.id!=e.id and p.region==e.region]
+        values=[raw[p.id] for p in peers]
+        if len(peers)<5 or not values:
+            result[e.id]=50;continue
+        below=sum(value<raw[e.id] for value in values);equal=sum(value==raw[e.id] for value in values)
+        result[e.id]=round(100*(below+.5*equal)/len(values))
+    return result
+
+def score(signals,min_score=68,min_families=2,novelty=50):
+    current=[]; stamp_now=now()
     for s in signals:
         if s['calendar']:continue
         t=s.get('published') or s.get('observed')
@@ -71,12 +151,22 @@ def score(signals,min_score=68,min_families=2):
                 except ValueError:t=None
             if t:
                 if t.tzinfo is None:t=t.replace(tzinfo=timezone.utc)
-                age=max(0,(stamp_now-t).total_seconds()/3600);ages.append(age)
+                age=max(0,(stamp_now-t).total_seconds()/3600)
                 if age<=72:current.append(s)
             else:current.append(s)
         else:current.append(s)
-    families={s['family'] for s in current}
-    velocity=min(100,25+18*len(current)+10*len(families)); corroboration=min(100,30*len(families)); freshness=max(0,round(100-(min(ages) if ages else 72)*2.4)); geo=min(100,35+20*max(0,len({s['region'] for s in current})-1)); clarity=80 if len({t for s in current for t in s['terms']})>=2 else 55; novelty=100
+    families={s['family'] for s in current};regions={s['region'] for s in current}
+    family_count=len(families);corroboration={0:0,1:35,2:75,3:90}.get(family_count,100)
+    by_family={}
+    for signal in current:by_family.setdefault(signal['family'],set()).update(signal.get('terms',[]))
+    topic_terms=terms(signals[0].get('event_title','')) if signals and signals[0].get('event_title') else set()
+    if not topic_terms:topic_terms={word for signal in current for word in signal.get('terms',[])}
+    specificity=min(100,round(100*len(topic_terms)/8))
+    if len(by_family)>=2:
+        family_terms=list(by_family.values());pairs=[len(a&b)/max(1,len(a|b)) for i,a in enumerate(family_terms) for b in family_terms[i+1:]]
+        clarity=round(.4*specificity+.6*100*(sum(pairs)/len(pairs) if pairs else 0))
+    else:clarity=round(.4*specificity)
+    velocity=velocity_score(signals);freshness=freshness_score(current);geo=round(100*min(3,len(regions))/3)
     overall=round(velocity*.22+corroboration*.25+freshness*.20+geo*.10+clarity*.13+novelty*.10)
     return {'velocity':velocity,'corroboration':corroboration,'freshness':freshness,'geographic':geo,'clarity':clarity,'novelty':novelty,'overall':overall,'families':sorted(families),'calendar_only':not bool(current),'eligible':bool(current) and len(families)>=min_families and overall>=min_score}
 def due(src):
@@ -170,10 +260,11 @@ def score_events(db):
             if not e:e=Event(slug=slug,title=sig.title,region=sig.region,first_seen=sig.observed,last_seen=sig.observed);db.add(e);db.flush();events.append(e);created+=1
         sig.event_id=e.id;e.last_seen=sig.observed;grouped+=1
     db.commit()
+    novelty_by_id=novelty_scores(events)
     for e in events:
         if e.status in {'rejected','launched'}:continue
-        sigs=db.scalars(select(Signal).where(Signal.event_id==e.id)).all();rows=[{'family':s.family,'region':s.region,'terms':s.terms,'calendar':s.calendar,'published':s.published,'observed':s.observed} for s in sigs]
-        policy=db.get(Setting,'eligibility_policy');s=score(rows,int((policy.value if policy else {}).get('min_score',cfg.min_eligibility_score)),int((policy.value if policy else {}).get('min_source_families',cfg.min_source_families)));e.scores=s
+        sigs=db.scalars(select(Signal).where(Signal.event_id==e.id)).all();rows=[{'family':s.family,'region':s.region,'terms':s.terms,'calendar':s.calendar,'published':s.published,'observed':s.observed,'metric':s.metric,'item_id':s.item_id,'event_title':e.title} for s in sigs]
+        policy=db.get(Setting,'eligibility_policy');s=score(rows,int((policy.value if policy else {}).get('min_score',cfg.min_eligibility_score)),int((policy.value if policy else {}).get('min_source_families',cfg.min_source_families)),novelty_by_id.get(e.id,50));e.scores=s
         e.evidence=[{'source':x.source_key,'family':x.family,'title':x.title,'url':x.link,'published_at':x.published.isoformat() if x.published else None,'observed_at':x.observed.isoformat() if x.observed else None,'is_calendar':x.calendar} for x in sigs]
         state,reason=safety(e.title,e.summary,' '.join(x.title for x in sigs));e.moderation_status=state;e.moderation_reason=reason
         if e.decision_reason.startswith('Operator '):continue
