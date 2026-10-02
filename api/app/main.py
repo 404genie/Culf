@@ -16,6 +16,7 @@ class Cfg(BaseSettings):
     ops_api_key:str=''; openai_api_key:str=''; openai_model:str='gpt-5-mini'
     launch_mode:str='shadow'; launch_enabled:bool=False; daily_launch_limit:int=5
     daily_sol_budget:float=0; max_sol_per_launch:float=0; launch_signer_secret:str=''; solana_rpc_url:str=''
+    launcher_url:str=''; launcher_api_token:str=''; launcher_timeout_seconds:int=20
     pump_holder_rewards_verified:bool=False; pump_sdk_enabled:bool=False; pump_fee_rate:float=.0005
     polling_minutes:int=5; source_timeout_seconds:int=15; min_eligibility_score:int=68; min_source_families:int=2
 cfg=Cfg()
@@ -192,7 +193,7 @@ def controls(db):
     ctl=db.get(Setting,'launch_control');paused=(ctl.value if ctl else {}).get('paused',True)
     adapter=False
     missing=[label for ok,label in [(cfg.launch_mode=='automatic','LAUNCH_MODE=automatic'),(cfg.launch_enabled,'LAUNCH_ENABLED=true'),(cfg.pump_holder_rewards_verified,'holder rewards verified'),(cfg.pump_sdk_enabled,'Pump SDK flag enabled'),(adapter,'reviewed Pump signer adapter installed'),(health,'all enabled sources healthy'),(bool(cfg.openai_api_key),'OpenAI research and moderation configured'),(bool(cfg.launch_signer_secret),'restricted signer configured'),(bool(cfg.solana_rpc_url),'Solana RPC configured'),(cfg.daily_sol_budget>0,'daily SOL budget set'),(cfg.max_sol_per_launch>0,'per-launch SOL cap set'),(count<min(5,cfg.daily_launch_limit),'daily launch capacity available') ] if not ok]
-    return {'mode':cfg.launch_mode,'enabled':cfg.launch_enabled and not paused,'paused':paused,'ready':not missing,'missing':missing,'launches_today':count,'daily_limit':min(5,cfg.daily_launch_limit),'daily_sol_budget':cfg.daily_sol_budget,'max_sol_per_launch':cfg.max_sol_per_launch,'holder_rewards_verified':cfg.pump_holder_rewards_verified,'pump_sdk_enabled':cfg.pump_sdk_enabled,'pump_adapter_installed':adapter,'sources_healthy':health,'openai_configured':bool(cfg.openai_api_key)}
+    return {'mode':cfg.launch_mode,'enabled':cfg.launch_enabled and not paused,'paused':paused,'ready':not missing,'missing':missing,'launches_today':count,'daily_limit':min(5,cfg.daily_launch_limit),'daily_sol_budget':cfg.daily_sol_budget,'max_sol_per_launch':cfg.max_sol_per_launch,'holder_rewards_verified':cfg.pump_holder_rewards_verified,'pump_sdk_enabled':cfg.pump_sdk_enabled,'pump_adapter_installed':adapter,'sources_healthy':health,'openai_configured':bool(cfg.openai_api_key),'dry_run_available':bool(cfg.launcher_url and cfg.launcher_api_token)}
 async def research(e,db):
     from openai import AsyncOpenAI
     c=AsyncOpenAI(api_key=cfg.openai_api_key);sigs=db.scalars(select(Signal).where(Signal.event_id==e.id).limit(12)).all()
@@ -314,9 +315,32 @@ def review(eid:int,body:dict,request:Request,_:None=Depends(ops),db:Session=Depe
 def launch(eid:int,request:Request,_:None=Depends(ops),db:Session=Depends(get_db)):
     e=db.get(Event,eid)
     if not e:raise HTTPException(404,'Candidate not found')
-    c=controls(db);checks={'candidate_eligible':e.status=='eligible','safety_clear':e.moderation_status=='clear','launch_controls_ready':c['ready'],'holder_rewards':cfg.pump_holder_rewards_verified}
-    if not all(checks.values()):logged(db,'launch_blocked','event',eid,checks);raise HTTPException(409,{'message':'Launch blocked by fail-closed controls','checks':checks,'missing':c['missing']})
-    raise HTTPException(501,'No reviewed Pump.fun signer adapter is installed. No transaction was submitted.')
+    c=controls(db);checks={'candidate_eligible':e.status=='eligible','safety_clear':e.moderation_status=='clear','dry_run_service_configured':c['dry_run_available']}
+    if not all(checks.values()):logged(db,'launch_blocked','event',eid,checks);raise HTTPException(409,{'message':'Dry-run request blocked by fail-closed controls','checks':checks})
+    existing=db.scalar(select(Launch).where(Launch.event_id==eid))
+    if existing:
+        if existing.status=='dry_run':return {'status':'dry_run','event_id':eid,'metadata_uri':existing.metadata_uri,'message':'This event already has a dry-run launch record. No transaction was submitted.'}
+        if existing.status not in {'launch_failed','preparing'}:raise HTTPException(409,'A launch record already exists for this event; reconcile it before retrying.')
+    name=(re.sub(r'[^A-Za-z0-9 ]+','',e.title).strip() or 'Culf Culture')[:32]
+    symbol='CULF'+hashlib.sha1(e.slug.encode()).hexdigest()[:4].upper()
+    idem=f'culf-event-{eid}';payload={'event_id':eid,'idempotency_key':idem,'name':name,'symbol':symbol,'event_title':e.title,'event_slug':e.slug,'summary':e.summary,'region':e.region,'category':e.category,'detected_at':e.first_seen.isoformat(),'evidence':e.evidence}
+    if not existing:
+        existing=Launch(event_id=eid,status='preparing',name=name,symbol=symbol,mode='dry_run');db.add(existing);db.commit()
+    else:
+        existing.status='preparing';db.commit()
+    try:
+        with httpx.Client(timeout=cfg.launcher_timeout_seconds) as client:
+            r=client.post(cfg.launcher_url.rstrip('/')+'/v1/launch/dry-run',json=payload,headers={'Authorization':f'Bearer {cfg.launcher_api_token}','Idempotency-Key':payload['idempotency_key']})
+            r.raise_for_status();result=r.json()
+    except Exception as ex:
+        existing.status='launch_failed';logged(db,'launch_dry_run_failed','event',eid,{'error':str(ex)[:300]});db.commit();raise HTTPException(502,'Dry-run service failed; no token transaction was submitted.')
+    if result.get('mode')!='dry-run' or result.get('transaction_submitted') is not False:
+        existing.status='launch_failed';logged(db,'launch_dry_run_invalid_response','event',eid,{'response_keys':list(result)[:20]});db.commit();raise HTTPException(502,'Dry-run service returned an invalid or unsafe response.')
+    existing.status='dry_run';existing.metadata_uri=result.get('metadata_uri');existing.holder_rewards=False;existing.name=name;existing.symbol=symbol
+    logged(db,'launch_dry_run_prepared','event',eid,{'launch_id':existing.id,'metadata_uri':existing.metadata_uri,'artwork_pinned':result.get('artwork_pinned',False),'metadata_pinned':result.get('metadata_pinned',False),'transaction_submitted':False});db.commit()
+    pinned=bool(existing.metadata_uri)
+    message=(f"Dry-run prepared and metadata pinned: {existing.metadata_uri}." if pinned else 'Dry-run prepared, but metadata is not pinned. Configure PINATA_JWT to store it durably.')+' No wallet was accessed and no transaction was submitted.'
+    return {'status':'dry_run','event_id':eid,'name':name,'symbol':symbol,'metadata_uri':existing.metadata_uri,'artwork_pinned':result.get('artwork_pinned',False),'metadata_pinned':result.get('metadata_pinned',False),'artwork_preview_svg':result.get('artwork_preview_svg'),'transaction_submitted':False,'message':message}
 @app.get('/api/ops/audit')
 def audit(limit:int=100,_:None=Depends(ops),db:Session=Depends(get_db)):
     return {'items':[{'actor':x.actor,'action':x.action,'entity_type':x.entity,'entity_id':x.entity_id,'details':x.details,'created_at':x.created.isoformat()} for x in db.scalars(select(Audit).order_by(Audit.created.desc()).limit(min(500,max(1,limit)))).all()]}
