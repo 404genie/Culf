@@ -44,13 +44,15 @@ class Setting(Base):
 
 REGIONS={'Japan':('JP','ja'),'Nigeria':('NG','en'),'United States':('US','en')}
 RSS=[('nhk','NHK World','NHK','news_nhk','Japan','https://www3.nhk.or.jp/rss/news/cat0.xml'),('japan_times','The Japan Times','The Japan Times','news_japan_times','Japan','https://www.japantimes.co.jp/feed/'),('premium_times','Premium Times','Premium Times Nigeria','news_premium_times','Nigeria','https://www.premiumtimesng.com/feed'),('ap_news','AP US News','Associated Press','news_ap','United States','https://apnews.com/hub/us-news?output=rss')]
-SOURCE_LIST=[('gdelt','GDELT','news_api','gdelt_global','GDELT Project','Public API; retain publisher links',15),('wikipedia','Wikipedia Pageviews','attention_api','wikimedia','Wikimedia Foundation','Aggregate views; link to article',1440),('nager','Nager.Date','calendar_api','nager_date','Nager.Date','Calendar context only',10080)]+[(k,n,'rss',f,o,'Headlines and links only; verify live commercial terms',60) for k,n,o,f,r,u in RSS]
+SOURCE_LIST=[('gdelt','GDELT','news_api','gdelt_global','GDELT Project','Public API; retain publisher links',5),('wikipedia','Wikipedia Pageviews','attention_api','wikimedia','Wikimedia Foundation','Aggregate views; link to article',1440),('nager','Nager.Date','calendar_api','nager_date','Nager.Date','Calendar context only',10080)]+[(k,n,'rss',f,o,'Headlines and links only; verify live commercial terms',60) for k,n,o,f,r,u in RSS]
 BLOCK={'death','dead','killed','fatal','murder','shooting','massacre','war','terror','earthquake','flood','wildfire','hurricane','typhoon','disaster','tragedy','missing child','abuse','suicide','rape','hate crime','hostage','explosion'}
 STOP={'the','and','for','with','from','that','this','will','after','over','into','about','amid','says','said','new','their','what','when','where','which','they','has','was','are','you'}
 def terms(s): return {w for w in re.findall(r'[a-z0-9]{3,}',s.lower()) if w not in STOP}
 def seed_sources(db):
     for key,name,kind,family,owner,permitted,cadence in SOURCE_LIST:
-        if not db.scalar(select(Source).where(Source.key==key)): db.add(Source(key=key,name=name,kind=kind,family=family,owner=owner,permitted=permitted,cadence=cadence))
+        src=db.scalar(select(Source).where(Source.key==key))
+        if not src:db.add(Source(key=key,name=name,kind=kind,family=family,owner=owner,permitted=permitted,cadence=cadence))
+        elif key=='gdelt' and src.cadence>cadence:src.cadence=cadence
     db.commit()
 def get_db():
     db=DB()
@@ -157,19 +159,29 @@ def dtgdelt(s):
 async def collect(db):
     seed_sources(db); got=[]; errors=[]; attempted=set()
     async with httpx.AsyncClient(timeout=cfg.source_timeout_seconds,follow_redirects=True,headers={'User-Agent':'CulfCultureMonitor/0.1'}) as c:
+        src=db.scalar(select(Source).where(Source.key=='gdelt'))
+        if src and src.enabled and due(src):
+            attempted.add(src.key)
+            cursor=db.get(Setting,'gdelt_region_cursor')
+            region=(cursor.value if cursor else {}).get('region','Japan')
+            if region not in REGIONS:region='Japan'
+            regions=list(REGIONS);next_region=regions[(regions.index(region)+1)%len(regions)]
+            if cursor:cursor.value={'region':next_region}
+            else:db.add(Setting(key='gdelt_region_cursor',value={'region':next_region}))
+            try:
+                q={'Japan':'Japan OR Japanese','Nigeria':'Nigeria OR Nigerian','United States':'United States OR US'}[region]
+                r=await c.get('https://api.gdeltproject.org/api/v2/doc/doc',params={'query':q,'mode':'ArtList','format':'json','maxrecords':30,'sort':'HybridRel'})
+                if r.status_code==429:raise RuntimeError('GDELT rate limited this poll (HTTP 429); retrying at the next scheduled poll')
+                if r.status_code>=400:raise RuntimeError(f'GDELT returned HTTP {r.status_code}')
+                try:payload=r.json()
+                except ValueError:raise RuntimeError(f'GDELT returned non-JSON content (HTTP {r.status_code}, content-type {r.headers.get("content-type","unknown")})')
+                fammap={'nhk.or.jp':'news_nhk','japantimes.co.jp':'news_japan_times','premiumtimesng.com':'news_premium_times','apnews.com':'news_ap'}
+                for x in payload.get('articles',[]):
+                    title=x.get('title','').strip();link=x.get('url','')
+                    if title and link:
+                        host=(x.get('domain') or '').lower();got.append(dict(source_key='gdelt',family=fammap.get(host,'gdelt_global'),item_id=link,title=title,link=link,published=dtgdelt(x.get('seendate')),region=region,terms=list(terms(title))[:12],metric=0,calendar=False))
+            except Exception as e:errors.append(('gdelt',str(e)[:180] or type(e).__name__))
         for region in REGIONS:
-            src=db.scalar(select(Source).where(Source.key=='gdelt'))
-            if src and src.enabled and due(src):
-                attempted.add(src.key)
-                try:
-                    q={'Japan':'Japan OR Japanese','Nigeria':'Nigeria OR Nigerian','United States':'United States OR US'}[region]
-                    r=await c.get('https://api.gdeltproject.org/api/v2/doc/doc',params={'query':q,'mode':'ArtList','format':'json','maxrecords':30,'sort':'HybridRel'});r.raise_for_status()
-                    fammap={'nhk.or.jp':'news_nhk','japantimes.co.jp':'news_japan_times','premiumtimesng.com':'news_premium_times','apnews.com':'news_ap'}
-                    for x in r.json().get('articles',[]):
-                        title=x.get('title','').strip();link=x.get('url','')
-                        if title and link:
-                            host=(x.get('domain') or '').lower();got.append(dict(source_key='gdelt',family=fammap.get(host,'gdelt_global'),item_id=link,title=title,link=link,published=dtgdelt(x.get('seendate')),region=region,terms=list(terms(title))[:12],metric=0,calendar=False))
-                except Exception as e:errors.append(('gdelt',str(e)[:180]))
             src=db.scalar(select(Source).where(Source.key=='wikipedia'))
             if src and src.enabled and due(src):
                 attempted.add(src.key)
