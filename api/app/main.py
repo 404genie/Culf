@@ -149,6 +149,10 @@ def score(signals,min_score=68,min_families=2,humor=50):
     humor=max(0,min(100,int(humor)))
     overall=round(velocity*.22+corroboration*.25+freshness*.20+geo*.10+clarity*.13+humor*.10)
     return {'velocity':velocity,'corroboration':corroboration,'freshness':freshness,'geographic':geo,'clarity':clarity,'humor':humor,'overall':overall,'families':sorted(families),'calendar_only':not bool(current),'eligible':bool(current) and len(families)>=min_families and overall>=min_score}
+def research_ready(scores,min_families):
+    # Assess meme potential once there is fresh, independent evidence, before
+    # the final weighted score. The AI cannot bypass these evidence gates.
+    return not scores['calendar_only'] and scores['freshness']>0 and len(scores['families'])>=min_families
 def due(src):
     if not src.last_polled:return True
     last=src.last_polled.replace(tzinfo=src.last_polled.tzinfo or timezone.utc)
@@ -253,22 +257,23 @@ def score_events(db):
     for e in events:
         if e.status in {'rejected','launched'}:continue
         sigs=db.scalars(select(Signal).where(Signal.event_id==e.id)).all();rows=[{'family':s.family,'region':s.region,'terms':s.terms,'calendar':s.calendar,'published':s.published,'observed':s.observed,'metric':s.metric,'item_id':s.item_id,'event_title':e.title} for s in sigs]
-        policy=db.get(Setting,'eligibility_policy');assessment=e.ai_assessment or {};s=score(rows,int((policy.value if policy else {}).get('min_score',cfg.min_eligibility_score)),int((policy.value if policy else {}).get('min_source_families',cfg.min_source_families)),assessment.get('humor_score',50));e.scores=s
+        policy=db.get(Setting,'eligibility_policy');p=policy.value if policy else {};min_families=int(p.get('min_source_families',cfg.min_source_families));assessment=e.ai_assessment or {};s=score(rows,int(p.get('min_score',cfg.min_eligibility_score)),min_families,assessment.get('humor_score',50));e.scores=s
         e.evidence=[{'source':x.source_key,'family':x.family,'title':x.title,'url':x.link,'published_at':x.published.isoformat() if x.published else None,'observed_at':x.observed.isoformat() if x.observed else None,'is_calendar':x.calendar} for x in sigs]
         state,reason=safety(e.title,e.summary,' '.join(x.title for x in sigs));e.moderation_status=state;e.moderation_reason=reason
         if e.decision_reason.startswith('Operator '):continue
         if state=='blocked':e.status='rejected';e.decision_reason=reason
         elif state=='held':e.status='held';e.decision_reason=reason
+        elif cfg.openai_api_key and 'humor_score' not in assessment and research_ready(s,min_families):e.status='researching';e.decision_reason='Fresh evidence from independent source families is ready for cited event and humor research.'
         elif s['eligible']:
-            if cfg.openai_api_key and not e.ai_assessment:e.status='researching'
-            elif cfg.openai_api_key and 'humor_score' not in (e.ai_assessment or {}):e.status='researching'
-            elif cfg.openai_api_key:
+            if cfg.openai_api_key:
                 a=e.ai_assessment or {};good=e.ai_confidence>=.65 and not a.get('risk_flags') and not a.get('moderation_flagged') and len(a.get('citations',[]))>=2
                 e.status='eligible' if good else 'held'
             else:e.status='eligible'
-            e.decision_reason=f"Rule score {s['overall']}; independent families {', '.join(s['families'])}. AI does not grant eligibility."
-        elif e.ai_assessment:e.status='held';e.decision_reason=f"Final score including humor ({s['overall']}/100) is below the configured eligibility threshold."
-        else:e.status='detected';e.decision_reason='Calendar signals alone cannot qualify; candidate must meet score and two-family threshold.' if s['calendar_only'] else f"Below eligibility threshold ({s['overall']}/100; requires 68 and 2 independent families)."
+            e.decision_reason=f"Final score {s['overall']}, including the evidence-based humor assessment; independent families {', '.join(s['families'])}. Safety, citation, and score gates passed."
+        elif e.ai_assessment:
+            a=e.ai_assessment;good=e.ai_confidence>=.65 and not a.get('risk_flags') and not a.get('moderation_flagged') and len(a.get('citations',[]))>=2
+            e.status='detected' if good else 'held';e.decision_reason=f"Final score including humor ({s['overall']}/100) is below the configured eligibility threshold." if good else 'AI risk or insufficient cited evidence; held for review.'
+        else:e.status='detected';e.decision_reason='Calendar signals alone cannot qualify; candidate must meet score and two-family threshold.' if s['calendar_only'] else f"Below eligibility threshold ({s['overall']}/100; requires {min_families} independent families and the configured score)."
     db.commit();return {'signals_grouped':grouped,'candidates_created':created}
 def controls(db):
     # Compare DATE to DATE. Passing an ISO string makes PostgreSQL infer VARCHAR,
@@ -296,15 +301,15 @@ async def research(e,db):
 async def cycle(db):
     added,errors=await collect(db);grouped=score_events(db);researched=0
     if cfg.openai_api_key:
-        for e in db.scalars(select(Event).where(Event.status=='researching').limit(12)).all():
+        for e in db.scalars(select(Event).where(Event.status=='researching').order_by(Event.first_seen.asc()).limit(12)).all():
             try:
                 a=await research(e,db);e.ai_assessment=a;e.ai_confidence=float(a['confidence']);e.summary=a['summary'][:2500];e.category=a['category'][:60]
                 e.evidence+= [{'source':'openai_web_search','family':'openai_research','title':c['title'],'url':c['url'],'observed_at':now().isoformat(),'is_calendar':False} for c in a['citations']]
                 sigs=db.scalars(select(Signal).where(Signal.event_id==e.id)).all();rows=[{'family':x.family,'region':x.region,'terms':x.terms,'calendar':x.calendar,'published':x.published,'observed':x.observed,'metric':x.metric,'event_title':e.title} for x in sigs]
                 policy=db.get(Setting,'eligibility_policy');p=policy.value if policy else {};e.scores=score(rows,int(p.get('min_score',cfg.min_eligibility_score)),int(p.get('min_source_families',cfg.min_source_families)),a['humor_score'])
                 if a['risk_flags'] or a['moderation_flagged'] or len(a['citations'])<2 or e.ai_confidence<.65:e.status='held';e.moderation_status='held';e.moderation_reason='AI risk or insufficient cited evidence; held for review.'
-                elif not e.scores['eligible']:e.status='held';e.moderation_status='held';e.moderation_reason='Final score including the humor assessment fell below the configured threshold.'
-                else:e.status='eligible';e.moderation_status='clear';e.moderation_reason='Passed deterministic checks, OpenAI Moderation, and research citation gate.'
+                elif not e.scores['eligible']:e.status='detected';e.moderation_status='clear';e.moderation_reason=f"Research passed; final score including humor is {e.scores['overall']}/100 and remains below the eligibility threshold."
+                else:e.status='eligible';e.moderation_status='clear';e.moderation_reason='Passed deterministic checks, OpenAI Moderation, research citation gate, and final score threshold.'
                 researched+=1
             except Exception as ex:e.status='held';e.moderation_status='held';e.moderation_reason=f'Research failed closed: {str(ex)[:180]}'
         db.commit()
