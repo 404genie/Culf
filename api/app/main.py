@@ -138,17 +138,18 @@ async def collect(db):
                             except (ValueError,TypeError):pass
                         got.append(dict(source_key=key,family=family,item_id=x.get('id') or link,title=title,link=link,published=stamp,region=region,terms=list(terms(title)),metric=0,calendar=False))
                 except Exception as e:errors.append((key,str(e)[:180]))
-    inserted=set()
+    inserted=set();new_signals=0
     for x in got:
         ident=(x['source_key'],x['item_id'])
         if ident in inserted:continue
         inserted.add(ident)
-        if not db.scalar(select(Signal.id).where(Signal.source_key==x['source_key'],Signal.item_id==x['item_id'])):db.add(Signal(**x))
+        if not db.scalar(select(Signal.id).where(Signal.source_key==x['source_key'],Signal.item_id==x['item_id'])):
+            db.add(Signal(**x));new_signals+=1
     db.commit()
     for src in db.scalars(select(Source)).all():
         if src.key in attempted:
             src.last_polled=now(); err=next((e for k,e in errors if k==src.key),None);src.last_error=err;src.health='degraded' if err else 'healthy'
-    db.commit();return len(got),errors
+    db.commit();return new_signals,errors
 def cluster(title,region,events,calendar=False):
     a=terms(title);best=None;mx=0
     for e in events:
@@ -157,18 +158,18 @@ def cluster(title,region,events,calendar=False):
         if similar>mx:best,mx=e,similar
     return best if mx>=.27 else None
 def score_events(db):
-    pending=db.scalars(select(Signal).where(Signal.event_id.is_(None)).order_by(Signal.observed.asc())).all();events=db.scalars(select(Event).where(Event.status!='rejected')).all()
+    pending=db.scalars(select(Signal).where(Signal.event_id.is_(None)).order_by(Signal.observed.asc())).all();events=db.scalars(select(Event).where(Event.status!='rejected')).all();created=0;grouped=0
     for sig in pending:
         e=cluster(sig.title,sig.region,events,sig.calendar)
         if sig.calendar:
-            if e:sig.event_id=e.id
+            if e:sig.event_id=e.id;grouped+=1
             continue
         if not e:
             slug=f"{sig.region.lower().replace(' ','-')}-{re.sub(r'[^a-z0-9]+','-',sig.title.lower()).strip('-')[:100]}";slug=slug.strip('-') or hashlib.sha1(sig.title.encode()).hexdigest()[:12]
             e=db.scalar(select(Event).where(Event.slug==slug))
-            if not e:e=Event(slug=slug,title=sig.title,region=sig.region,first_seen=sig.observed,last_seen=sig.observed);db.add(e);db.flush();events.append(e)
-        sig.event_id=e.id;e.last_seen=sig.observed
-    db.commit()
+            if not e:e=Event(slug=slug,title=sig.title,region=sig.region,first_seen=sig.observed,last_seen=sig.observed);db.add(e);db.flush();events.append(e);created+=1
+        sig.event_id=e.id;e.last_seen=sig.observed;grouped+=1
+    db.commit();return {'signals_grouped':grouped,'candidates_created':created}
     for e in events:
         if e.status in {'rejected','launched'}:continue
         sigs=db.scalars(select(Signal).where(Signal.event_id==e.id)).all();rows=[{'family':s.family,'region':s.region,'terms':s.terms,'calendar':s.calendar,'published':s.published,'observed':s.observed} for s in sigs]
@@ -222,7 +223,9 @@ async def cycle(db):
                 researched+=1
             except Exception as ex:e.status='held';e.moderation_status='held';e.moderation_reason=f'Research failed closed: {str(ex)[:180]}'
         db.commit()
-    return {'signals_added':added,'signals_grouped':grouped,'candidates_researched':researched,'errors':errors,'ran_at':now().isoformat()}
+    statuses=['detected','researching','eligible','held','rejected','launched','launch_failed']
+    counts={status:db.scalar(select(func.count(Event.id)).where(Event.status==status)) or 0 for status in statuses}
+    return {'signals_added':added,**grouped,'candidates_researched':researched,'candidate_counts':counts,'errors':[{'source':source,'message':message} for source,message in errors],'ran_at':now().isoformat()}
 async def background():
     while True:
         db=DB()
