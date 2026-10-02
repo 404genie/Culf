@@ -188,7 +188,9 @@ def score_events(db):
         else:e.status='detected';e.decision_reason='Calendar signals alone cannot qualify; candidate must meet score and two-family threshold.' if s['calendar_only'] else f"Below eligibility threshold ({s['overall']}/100; requires 68 and 2 independent families)."
     db.commit()
 def controls(db):
-    today=now().date().isoformat();count=db.scalar(select(func.count(Launch.id)).where(Launch.status=='launched',func.date(Launch.created)==today)) or 0
+    # Compare DATE to DATE. Passing an ISO string makes PostgreSQL infer VARCHAR,
+    # which raises ``operator does not exist: date = character varying``.
+    today=now().date();count=db.scalar(select(func.count(Launch.id)).where(Launch.status=='launched',func.date(Launch.created)==today)) or 0
     sources=db.scalars(select(Source).where(Source.enabled.is_(True))).all();health=bool(sources) and all(s.health=='healthy' for s in sources)
     ctl=db.get(Setting,'launch_control');paused=(ctl.value if ctl else {}).get('paused',True)
     adapter=False
