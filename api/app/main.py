@@ -169,7 +169,7 @@ def score_events(db):
             e=db.scalar(select(Event).where(Event.slug==slug))
             if not e:e=Event(slug=slug,title=sig.title,region=sig.region,first_seen=sig.observed,last_seen=sig.observed);db.add(e);db.flush();events.append(e);created+=1
         sig.event_id=e.id;e.last_seen=sig.observed;grouped+=1
-    db.commit();return {'signals_grouped':grouped,'candidates_created':created}
+    db.commit()
     for e in events:
         if e.status in {'rejected','launched'}:continue
         sigs=db.scalars(select(Signal).where(Signal.event_id==e.id)).all();rows=[{'family':s.family,'region':s.region,'terms':s.terms,'calendar':s.calendar,'published':s.published,'observed':s.observed} for s in sigs]
@@ -187,7 +187,7 @@ def score_events(db):
             else:e.status='eligible'
             e.decision_reason=f"Rule score {s['overall']}; independent families {', '.join(s['families'])}. AI does not grant eligibility."
         else:e.status='detected';e.decision_reason='Calendar signals alone cannot qualify; candidate must meet score and two-family threshold.' if s['calendar_only'] else f"Below eligibility threshold ({s['overall']}/100; requires 68 and 2 independent families)."
-    db.commit()
+    db.commit();return {'signals_grouped':grouped,'candidates_created':created}
 def controls(db):
     # Compare DATE to DATE. Passing an ISO string makes PostgreSQL infer VARCHAR,
     # which raises ``operator does not exist: date = character varying``.
