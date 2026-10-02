@@ -8,6 +8,12 @@ def test_duplicate_family_does_not_corroborate():
 def test_two_families_can_pass():
     t=datetime.now(timezone.utc);rows=[{'family':f,'calendar':False,'region':'US','terms':['music','festival'],'observed':t} for f in ['news_ap','wikimedia']]
     assert score(rows)['eligible']
+def test_humor_is_weighted_but_does_not_replace_evidence_gates():
+    t=datetime.now(timezone.utc);rows=[{'family':f,'calendar':False,'region':'US','terms':['music','festival'],'observed':t} for f in ['news_ap','wikimedia']]
+    low=score(rows,humor=0);high=score(rows,humor=100)
+    assert high['overall']-low['overall']==10
+    assert low['eligible'] and high['eligible']
+    assert not score(rows[:1],humor=100)['eligible']
 def test_stale_signals_do_not_qualify():
     old=datetime.now(timezone.utc)-__import__('datetime').timedelta(days=5)
     rows=[{'family':f,'calendar':False,'region':'Japan','terms':['festival','music'],'observed':old} for f in ['news_nhk','wikimedia']]

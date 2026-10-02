@@ -2,14 +2,14 @@
 
 ## Candidate score definitions
 
-The score is a weighted summary, not an automatic launch decision. It uses velocity 22%, corroboration 25%, freshness 20%, geography 10%, clarity 13%, and novelty 10%. Candidates must also score at least 68, have at least two independent source families, and pass the separate safety and research gates.
+The score is a weighted summary, not an automatic launch decision. It uses velocity 22%, corroboration 25%, freshness 20%, geography 10%, clarity 13%, and humor 10%. Candidates must also score at least 68, have at least two independent source families, and pass the separate safety and research gates.
 
 - **Velocity:** Counts distinct source-family/hour observations in the latest six hours against the preceding 66 hours. Syndicated copies from the same family in one hour count once. Wikipedia pageview growth contributes when two snapshots exist. Before a baseline exists, recent family-hour activity gets a conservative provisional score; it is not described as measured acceleration.
 - **Corroboration:** Counts independent source families: 0 for none, 35 for one, 75 for two, 90 for three, and 100 for four or more. Repeated URLs or syndicated copies from one family do not add families.
 - **Freshness:** Averages the freshest supporting item from each family. Scores decline from 100 for evidence within an hour, to 85 at six hours, 50 at 24 hours, and 0 at 72 hours. Calendar-only evidence is excluded.
 - **Geographic breadth:** Scores the number of Culf launch regions represented: one of three is 33, two is 67, and all three is 100.
 - **Clarity:** Combines event-title specificity with overlap between the terms used by independent source families. A single family cannot receive the agreement portion of the score.
-- **Novelty:** Ranks title-term rarity and dissimilarity against other tracked candidates from the same region. It is a regional percentile, not a fixed bonus. With fewer than five regional peers, novelty is neutral at 50; tied candidates receive a midpoint rank rather than all receiving 100.
+- **Humor:** Rates harmless, evidence-based meme potential from cited facts, focusing on irony, absurdity, and relatability. OpenAI assigns this during research; before that, it is neutral at 50. Tragedy, harm, and mockery of vulnerable people score 0. Research only runs after the candidate passes the evidence-based pre-screen, so humor cannot independently make an ineligible candidate eligible. The research rating is stored with a short rationale and can lower the final score.
 
 The current score is a shadow-mode aid. Review source evidence and decision reasons before changing weights or eligibility thresholds.
 
