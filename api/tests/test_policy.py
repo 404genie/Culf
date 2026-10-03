@@ -1,5 +1,5 @@
 from datetime import datetime,timezone
-from app.main import score,safety,research_ready
+from app.main import score,safety,humor_research_ready
 def test_calendar_cannot_qualify():
     assert not score([{'family':'nager_date','calendar':True,'region':'Japan','terms':['festival']}])['eligible']
 def test_duplicate_family_does_not_corroborate():
@@ -14,12 +14,15 @@ def test_humor_is_weighted_but_does_not_replace_evidence_gates():
     assert high['overall']-low['overall']==10
     assert low['eligible'] and high['eligible']
     assert not score(rows[:1],humor=100)['eligible']
-def test_humor_research_starts_before_final_score_gate():
-    t=datetime.now(timezone.utc);rows=[{'family':f,'calendar':False,'region':'Japan','terms':[],'observed':t,'event_title':'Festival'} for f in ['news_nhk','wikimedia']]
-    preliminary=score(rows)
-    assert not preliminary['eligible']
-    assert research_ready(preliminary,2)
-    assert not research_ready(score(rows[:1]),2)
+def test_humor_research_is_not_blocked_by_eligibility_evidence_gates():
+    old=datetime.now(timezone.utc)-__import__('datetime').timedelta(days=5)
+    single_stale=[{'family':'news_nhk','calendar':False,'region':'Japan','terms':[],'observed':old,'event_title':'Festival'}]
+    assert not score(single_stale)['eligible']
+    assert humor_research_ready(single_stale,{})
+    assert humor_research_ready(single_stale,{'humor_score':50})
+    assert humor_research_ready(single_stale,{'humor_score':72,'humor_version':1})
+    assert not humor_research_ready(single_stale,{'humor_score':72,'humor_version':2})
+    assert not humor_research_ready([],{})
 def test_stale_signals_do_not_qualify():
     old=datetime.now(timezone.utc)-__import__('datetime').timedelta(days=5)
     rows=[{'family':f,'calendar':False,'region':'Japan','terms':['festival','music'],'observed':old} for f in ['news_nhk','wikimedia']]
